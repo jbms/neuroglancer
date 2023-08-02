@@ -232,6 +232,9 @@ export class MeshShaderManager {
       subChunkBegin: number,
       subChunkEnd: number,
   ) {
+    if (subChunkEnd <= subChunkBegin) {
+      console.log(`INVALID: subChunkBegin (${subChunkBegin}) < subChunkEnd (${subChunkEnd})`);
+    }
     const indexBegin = fragmentChunk.meshData.subChunkOffsets[subChunkBegin];
     const indexEnd = fragmentChunk.meshData.subChunkOffsets[subChunkEnd];
     this.drawFragmentHelper(gl, shader, fragmentChunk, indexBegin, indexEnd);
@@ -588,6 +591,8 @@ export class MultiscaleMeshLayer extends
     const modelViewProjection =
         mat4.multiply(mat4.create(), projectionParameters.viewProjectionMat, modelMatrix);
 
+    console.log('modelMatrix', modelMatrix);
+    console.log('modelViewProjection', modelViewProjection);
     const clippingPlanes = getFrustrumPlanes(new Float32Array(24), modelViewProjection);
 
     const detailCutoff = this.displayState.renderScaleTarget.value;

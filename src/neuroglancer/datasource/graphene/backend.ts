@@ -14,37 +14,32 @@
  * limitations under the License.
  */
 
-import {WithParameters} from 'neuroglancer/chunk_manager/backend';
+import debounce from 'lodash/debounce';
+import {Chunk, ChunkSource, withChunkManager, WithParameters} from 'neuroglancer/chunk_manager/backend';
+import {ChunkPriorityTier, ChunkState} from 'neuroglancer/chunk_manager/base';
 import {WithSharedCredentialsProviderCounterpart} from 'neuroglancer/credentials_provider/shared_counterpart';
+import {CHUNKED_GRAPH_LAYER_RPC_ID, CHUNKED_GRAPH_RENDER_LAYER_UPDATE_SOURCES_RPC_ID, ChunkedGraphChunkSpecification, ChunkedGraphSourceParameters, getGrapheneFragmentKey, isBaseSegmentId, MeshSourceParameters, MultiscaleMeshSourceParameters, RENDER_RATIO_LIMIT, responseIdentity} from 'neuroglancer/datasource/graphene/base';
+import {decodeManifestChunk} from 'neuroglancer/datasource/precomputed/backend';
 import {assignMeshFragmentData, assignMultiscaleMeshFragmentData, FragmentChunk, FragmentId, ManifestChunk, MeshSource, MultiscaleFragmentChunk, MultiscaleManifestChunk, MultiscaleMeshSource} from 'neuroglancer/mesh/backend';
-import {getGrapheneFragmentKey, MultiscaleMeshSourceParameters, responseIdentity} from 'neuroglancer/datasource/graphene/base';
+import {getOctreeSortPermutation, sortOctree} from 'neuroglancer/mesh/multiscale';
+import {DisplayDimensionRenderInfo} from 'neuroglancer/navigation_state';
+import {RenderedViewBackend, RenderLayerBackend, RenderLayerBackendAttachment} from 'neuroglancer/render_layer_backend';
+import {withSegmentationLayerBackendState} from 'neuroglancer/segmentation_display_state/backend';
+import {forEachVisibleSegment} from 'neuroglancer/segmentation_display_state/base';
+import {SharedWatchableValue} from 'neuroglancer/shared_watchable_value';
+import {deserializeTransformedSources, SliceViewChunkSourceBackend} from 'neuroglancer/sliceview/backend';
+import {forEachPlaneIntersectingVolumetricChunk, getNormalizedChunkLayout, SliceViewProjectionParameters, TransformedSource} from 'neuroglancer/sliceview/base';
+import {computeChunkBounds} from 'neuroglancer/sliceview/volume/backend';
+import {Uint64Set} from 'neuroglancer/uint64_set';
+import {fetchSpecialHttpByteRange} from 'neuroglancer/util/byte_range_http_requests';
 import {CancellationToken} from 'neuroglancer/util/cancellation';
+import {vec3, vec3Key} from 'neuroglancer/util/geom';
 import {isNotFoundError, responseArrayBuffer, responseJson} from 'neuroglancer/util/http_request';
+import {verifyObject} from 'neuroglancer/util/json';
 import {cancellableFetchSpecialOk, SpecialProtocolCredentials, SpecialProtocolCredentialsProvider} from 'neuroglancer/util/special_protocol_request';
 import {Uint64} from 'neuroglancer/util/uint64';
-import {registerSharedObject} from 'neuroglancer/worker_rpc';
-import {ChunkedGraphSourceParameters, MeshSourceParameters} from 'neuroglancer/datasource/graphene/base';
-import {decodeManifestChunk} from 'neuroglancer/datasource/precomputed/backend';
-import {fetchSpecialHttpByteRange} from 'neuroglancer/util/byte_range_http_requests';
-import debounce from 'lodash/debounce';
-import {withChunkManager, Chunk, ChunkSource} from 'neuroglancer/chunk_manager/backend';
-import {ChunkPriorityTier, ChunkState} from 'neuroglancer/chunk_manager/base';
-import {TransformedSource, forEachPlaneIntersectingVolumetricChunk, getNormalizedChunkLayout, SliceViewProjectionParameters} from 'neuroglancer/sliceview/base';
-import {CHUNKED_GRAPH_LAYER_RPC_ID, ChunkedGraphChunkSpecification, CHUNKED_GRAPH_RENDER_LAYER_UPDATE_SOURCES_RPC_ID, RENDER_RATIO_LIMIT} from 'neuroglancer/datasource/graphene/base';
-import {Uint64Set} from 'neuroglancer/uint64_set';
-import {vec3, vec3Key} from 'neuroglancer/util/geom';
-import {registerRPC, RPC} from 'neuroglancer/worker_rpc';
-
-import { deserializeTransformedSources, SliceViewChunkSourceBackend } from 'neuroglancer/sliceview/backend';
-import { getBasePriority, getPriorityTier, withSharedVisibility } from 'neuroglancer/visibility_priority/backend';
-import {isBaseSegmentId} from 'neuroglancer/datasource/graphene/base';
-import { withSegmentationLayerBackendState } from 'neuroglancer/segmentation_display_state/backend';
-import { RenderedViewBackend, RenderLayerBackend, RenderLayerBackendAttachment } from 'neuroglancer/render_layer_backend';
-import { SharedWatchableValue } from 'neuroglancer/shared_watchable_value';
-import { DisplayDimensionRenderInfo } from 'neuroglancer/navigation_state';
-import { forEachVisibleSegment } from 'neuroglancer/segmentation_display_state/base';
-import { computeChunkBounds } from 'neuroglancer/sliceview/volume/backend';
-import { verifyObject } from 'neuroglancer/util/json';
+import {getBasePriority, getPriorityTier, withSharedVisibility} from 'neuroglancer/visibility_priority/backend';
+import {registerRPC, registerSharedObject, RPC} from 'neuroglancer/worker_rpc';
 
 function getVerifiedFragmentPromise(
     credentialsProvider: SpecialProtocolCredentialsProvider,
@@ -140,16 +135,27 @@ interface GrapheneMultiscaleManifestChunk extends MultiscaleManifestChunk {
 
 function decodeMultiscaleManifestChunk(chunk: GrapheneMultiscaleManifestChunk, response: any) {
   verifyObject(response);
+  const origOctree = new Uint32Array(response.octree);
+  const {octree, indices: octreePermutation} = sortOctree(origOctree);
   chunk.manifest = {
     chunkShape: vec3.clone(response.chunkShape),
     chunkGridSpatialOrigin: vec3.clone(response.chunkGridSpatialOrigin),
     lodScales: new Float32Array(response.lodScales),
-    octree: new Uint32Array(response.octree),
+    octree,
     vertexOffsets: new Float32Array(response.lodScales.length * 3),
     clipLowerBound: vec3.clone(response.clipLowerBound),
     clipUpperBound: vec3.clone(response.clipUpperBound),
   }
-  chunk.fragmentIds = response.fragments;
+  chunk.manifest.clipLowerBound.fill(0);
+  chunk.manifest.clipUpperBound.fill(100000);
+  console.log(chunk.manifest);
+  const origFragmentIds = response.fragments as string[];
+  let numRows = origFragmentIds.length;
+  const fragmentIds = new Array<string>(numRows);
+  for (let i = 0; i < numRows; ++i) {
+    fragmentIds[i] = origFragmentIds[octreePermutation[i]];
+  }
+  chunk.fragmentIds = fragmentIds;
 }
 
 async function decodeMultiscaleFragmentChunk(

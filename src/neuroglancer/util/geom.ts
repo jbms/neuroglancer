@@ -173,7 +173,7 @@ export function mat3FromMat4(out: mat3, m: mat4) {
  * @param out Row-major array of shape `(6, 4)` specifying for each of the left, right, bottom, top,
  *     near, far clipping planes the `a`, `b`, `c`, `d` coefficients such that
  *     `0 < a * x + b * y + c * z + d` if the point `x, y, z` is inside the half-space of the
- * clipping plane.
+ *     clipping plane.
  * @param m Projection matrix
  */
 export function getFrustrumPlanes(out: Float32Array, m: mat4): Float32Array {
@@ -244,6 +244,7 @@ export function isAABBVisible(
     const sum = Math.max(a * xLower, a * xUpper) + Math.max(b * yLower, b * yUpper) +
         Math.max(c * zLower, c * zUpper) + d;
     if (sum < 0) {
+      console.log(`   failed due to plane ${i} a=${a}, b=${b}, c=${c}, d=${d}, sum=${sum}`);
       return false;
     }
   }

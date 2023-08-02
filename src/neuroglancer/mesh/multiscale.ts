@@ -15,9 +15,9 @@
  */
 
 import {isAABBVisible, mat4, vec3} from 'neuroglancer/util/geom';
-import {getOctreeChildIndex} from 'neuroglancer/util/zorder';
+import {getOctreeChildIndex, zorder3LessThan} from 'neuroglancer/util/zorder';
 
-const DEBUG_CHUNKS_TO_DRAW = false;
+const DEBUG_CHUNKS_TO_DRAW = true;
 
 export interface MultiscaleMeshManifest {
   /**
@@ -76,6 +76,75 @@ export interface MultiscaleMeshManifest {
   octree: Uint32Array;
 }
 
+export function sortOctree(octree: Uint32Array): {octree: Uint32Array, indices: Uint32Array} {
+  if ((octree.length % 5) !== 0) {
+    throw new Error('Invalid octree');
+  }
+  const numRows = octree.length / 5;
+  const indices = new Uint32Array(numRows);
+  for (let i = 0; i < numRows; ++i) {
+    indices[i] = i;
+  }
+  const sortChildrenOfRow = (row: number) => {
+    const childBeginAndVirtual = octree[row * 5 + 3];
+    const childEndAndEmpty = octree[row * 5 + 4];
+    const childBegin = (childBeginAndVirtual & 0x7FFFFFFF) >>> 0;
+    const childEnd = (childEndAndEmpty & 0x7FFFFFFF) >>> 0;
+    indices.subarray(childBegin, childEnd).sort((i, j) => {
+      return zorder3LessThan(
+                 octree[i * 5], octree[i * 5 + 1], octree[i * 5 + 2], octree[j * 5],
+                 octree[j * 5 + 1], octree[j * 5 + 2]) ?
+          -1 :
+          1;
+    });
+    for (let i = childBegin; i < childEnd; ++i) {
+      sortChildrenOfRow(i);
+    }
+  };
+  const inverseIndices = new Uint32Array(numRows);
+  for (let i = 0; i < numRows; ++i) {
+    inverseIndices[indices[i]] = i;
+  }
+  const newOctree = new Uint32Array(numRows * 5);
+  for (let newRow = 0; newRow < numRows; ++newRow) {
+    const oldRow = indices[newRow];
+    newOctree[newRow * 5] = octree[oldRow * 5];
+    newOctree[newRow * 5 + 1] = octree[oldRow * 5 + 1];
+    newOctree[newRow * 5 + 2] = octree[oldRow * 5 + 2];
+    const oldBeginAndVirtual = octree[oldRow * 5 + 3];
+    const oldEndAndEmpty = octree[oldRow * 5 + 4];
+    const oldBegin = (oldBeginAndVirtual & 0x7FFFFFFF) >>> 0;
+    const oldEnd = (oldEndAndEmpty & 0x7FFFFFFF) >>> 0;
+    let newBegin;
+    let newEnd;
+    if (oldBegin == oldEnd) {
+      newBegin = 0;
+      newEnd = 0;
+    } else {
+      newBegin = numRows;
+      newEnd = 0;
+      for (let i = oldBegin; i < oldEnd; ++i) {
+        let j = inverseIndices[i];
+        newBegin = Math.min(newBegin, j);
+        newEnd = Math.max(newEnd, j);
+      }
+      ++newEnd;
+    }
+    newOctree[newRow * 5 + 3] = newBegin | (oldBeginAndVirtual & 0x80000000);
+    newOctree[newRow * 5 + 4] = newEnd | (oldEndAndEmpty & 0x80000000);
+  }
+  newOctree[5*(numRows-1) + 4] &= 0x7FFFFFFF;
+  newOctree[5*(numRows-1) + 3] |= 0x80000000;
+  return {octree: newOctree, indices};
+}
+
+function printOctree(octree: Uint32Array) {
+  const numRows = octree.length / 5;
+  for (let i = 0; i < numRows; ++i) {
+    console.log(`row ${i}: x=${octree[5*i]}, y=${octree[5*i+1]}, z=${octree[5*i+2]}, start=${octree[5*i+3]&0x7FFFFFFF}, end=${octree[5*i+4]&0x7FFFFFFF}, virtual=${octree[5*i+3]>>>31}, empty=${octree[5*i+4]>>>31}`);
+  }
+}
+
 /**
  * @param detailCutoff Factor by which the spatial resolution of the mesh may be worse than the
  *     spatial resolution of a single viewport pixel.  For example, a value of 10 means that if a
@@ -85,7 +154,8 @@ export interface MultiscaleMeshManifest {
 export function getDesiredMultiscaleMeshChunks(
     manifest: MultiscaleMeshManifest, modelViewProjection: mat4, clippingPlanes: Float32Array,
     detailCutoff: number, viewportWidth: number, viewportHeight: number,
-    callback: (lod: number, row: number, renderScale: number, empty: number) => void) {
+    callback: (lod: number, row: number, renderScale: number, empty: number) =>
+        void) {
   const {octree, lodScales, chunkGridSpatialOrigin, chunkShape} = manifest;
   const maxLod = lodScales.length - 1;
   const m00 = modelViewProjection[0], m01 = modelViewProjection[4], m02 = modelViewProjection[8],
@@ -139,7 +209,8 @@ export function getDesiredMultiscaleMeshChunks(
         yLower = gridY * size * chunkShape[1] + chunkGridSpatialOrigin[1],
         zLower = gridZ * size * chunkShape[2] + chunkGridSpatialOrigin[2];
     let xUpper = xLower + size * chunkShape[0], yUpper = yLower + size * chunkShape[1],
-        zUpper = zLower + size * chunkShape[2];
+    zUpper = zLower + size * chunkShape[2];
+    console.log({xLower, xUpper, yLower, yUpper, zLower, zUpper});
     xLower = Math.max(xLower, objectXLower);
     yLower = Math.max(yLower, objectYLower);
     zLower = Math.max(zLower, objectZLower);
@@ -153,12 +224,15 @@ export function getDesiredMultiscaleMeshChunks(
 
       if (priorLodScale === 0 || pixelSize * detailCutoff < priorLodScale) {
         let lodScale = lodScales[lod];
-        if ((childBeginAndVirtual & (1 << 31)) !== 0) {
-          lodScale = 0;
-        }
 
         if (lodScale !== 0) {
-          callback(lod, row, lodScale / pixelSize, (childEndAndEmpty >>> 31));
+          const virtual = (childBeginAndVirtual >>> 31);
+          if (virtual) {
+            lodScale = 0;
+          }
+          const empty = (childEndAndEmpty >>> 31);
+          console.log(`callback for ${row}: empty=${empty}, virtual=${virtual}`);
+          callback(lod, row, lodScale / pixelSize, empty | virtual);
         }
 
         if (lod > 0 && (lodScale === 0 || pixelSize * detailCutoff < lodScale)) {
@@ -170,6 +244,8 @@ export function getDesiredMultiscaleMeshChunks(
           }
         }
       }
+    } else {
+      console.log('aabb not visible', {xLower, yLower, zLower, xUpper, yUpper, zUpper, clippingPlanes});
     }
   }
   handleChunk(maxLod, octree.length / 5 - 1, 0);
@@ -210,6 +286,7 @@ export function getMultiscaleChunksToDraw(
       const numSubChunks = entryLod === 0 ? 1 : 8;
       const entrySubChunkIndex = stack[stackIndex * stackEntryStride + 1];
       const entryRenderScale = stack[stackIndex * stackEntryStride + 2];
+      console.log('Finishing last chunk of last (finest) lod', {stackIndex, entryLod, entrySubChunkIndex, entryRenderScale, priorSubChunkIndex, entryRow, numSubChunks});
       if (targetStackIndex === stackDepth) {
         const endSubChunk = subChunkIndex & (numSubChunks - 1);
 
@@ -220,12 +297,14 @@ export function getMultiscaleChunksToDraw(
           }
           callback(entryLod, entryRow, priorSubChunkIndex, endSubChunk, entryRenderScale);
         }
+        console.log(`Setting priorSubChunkIndex = ${endSubChunk+1} and then returning`);
         priorSubChunkIndex = endSubChunk + 1;
         return;
       }
       if (priorSubChunkIndex !== numSubChunks && entryRow !== -1) {
         callback(entryLod, entryRow, priorSubChunkIndex, numSubChunks, entryRenderScale);
       }
+      console.log(`Setting priorSubChunkIndex = ${entrySubChunkIndex + 1}`);
       priorSubChunkIndex = entrySubChunkIndex + 1;
       --stackDepth;
     }
@@ -235,6 +314,7 @@ export function getMultiscaleChunksToDraw(
   if (DEBUG_CHUNKS_TO_DRAW) {
     console.log('');
     console.log('Starting to draw');
+    //printOctree(manifest.octree);
   }
   const {octree} = manifest;
   getDesiredMultiscaleMeshChunks(
